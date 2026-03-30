@@ -1,182 +1,180 @@
+# Home.py
 from streamlit_option_menu import option_menu
 import streamlit as st
-import pickle
-import http.client
-import json
-from urllib.parse import quote
 import requests
+import time
+import pickle
 import numpy as np
 
-similarities = []
-for i in range(15): #D:\PROJECTS\Movie-recommender-system\streamlitWebApp\similarity_chunk_1.pkl
-    filename = f"streamlitWebApp\similarity_chunk_{i+1}.pkl"
-# streamlitWebApp\similarity_chunk_1.pkl
-    with open(filename, 'rb') as f:
-        chunk_data = pickle.load(f)
-        similarities.append(chunk_data)
+# ────────────────────────────────────────────────
+#   CONFIG
+# ────────────────────────────────────────────────
+TMDB_API_KEY = "c3c775a1fab54e24e2fcbb4cec15b9f6"
+IMG_BASE     = "https://image.tmdb.org/t/p/w500"
+IMG_SMALL    = "https://image.tmdb.org/t/p/w185"
 
-# Concatenate all chunks into a single similarity matrix
-similarity = np.concatenate(similarities, axis=0)
+# ────────────────────────────────────────────────
+#   TMDB SEARCH - multiple results, resilient connection
+# ────────────────────────────────────────────────
+def search_movies_tmdb(query: str, max_results: int = 12):
+    if not query or not query.strip():
+        return []
 
+    query = query.strip()
 
-movies_list = pickle.load(open('movies.pkl', 'rb'))  # Keep the original DataFrame
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=3)
+    session.mount('https://', adapter)
 
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Connection": "close"
+    })
 
-def GetMovieFromID(id):
-    url = f"https://api.themoviedb.org/3/movie/{id}?language=en-US"
+    url = "https://api.themoviedb.org/3/search/movie"
 
-    headers = {
-        "accept": "application/json",
-        "Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJiMDg0YjA1ZDhhMzM1MTJjYWQwYTI3ZDM1MmZiYTljNCIsInN1YiI6IjY1YmY2ODRjYTM1YzhlMDE2M2Q1NTk5OCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.obJ65ZxM_vuIPmjQPZQ4j8bkJSLF4qKQEzdK3VV80ng"
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": query,
+        "include_adult": False,
+        "language": "en-US",
     }
 
-    response = requests.get(url, headers=headers)
+    for attempt in range(5):
+        try:
+            response = session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
 
-    if response.ok:
-        return response.json()
-    else:
-        return None
+            movies = []
+            for m in data.get("results", [])[:max_results]:
+                poster = IMG_BASE + m["poster_path"] if m.get("poster_path") else None
+                small_poster = IMG_SMALL + m["poster_path"] if m.get("poster_path") else None
 
+                movies.append({
+                    "id": m.get("id"),
+                    "title": m.get("title", "—"),
+                    "year": (m.get("release_date") or "")[:4] or "—",
+                    "rating": m.get("vote_average", 0),
+                    "overview": m.get("overview", "No overview available."),
+                    "poster": poster,
+                    "small_poster": small_poster
+                })
+            return movies
 
-def GetMovieFromName(movie_name):
-    myAPI_key = "apikey 7hSbLbqnMVnRvRsttatgRx:1HxgNB8iJnU9eWI5FHMjp1"
+        except requests.exceptions.RequestException as e:
+            if attempt == 4:
+                st.error(f"TMDB connection failed after retries.\nError: {str(e)}\nTry mobile hotspot or pause antivirus.")
+                return []
+            time.sleep(2 ** attempt + 0.5)
 
-    conn = http.client.HTTPSConnection("api.collectapi.com")
-
-    headers = {
-        'content-type': "application/json",
-        'authorization': myAPI_key
-    }
-
-    encoded_movie_name = quote(movie_name)
-    conn.request("GET", f"/imdb/imdbSearchByName?query={encoded_movie_name}", headers=headers)
-
-    res = conn.getresponse()    
-    data = res.read()
-    decoded_data = data.decode("utf-8")
-
-    json_data = json.loads(decoded_data)
-
-    if 'result' in json_data:
-        movies = json_data['result']
-
-        if movies:
-            return movies[0]
+    return []
 
 
-def recommend(movie):
-    movie_index = movies_list[movies_list['title'] == movie].index[0]
+# ────────────────────────────────────────────────
+#   Recommender data loader
+# ────────────────────────────────────────────────
+@st.cache_resource
+def load_recommender_data():
+    similarities = []
+    for i in range(15):
+        with open(f"similarity_chunk_{i+1}.pkl", "rb") as f:
+            similarities.append(pickle.load(f))
+    similarity = np.concatenate(similarities, axis=0)
+    movies_list = pickle.load(open("movies.pkl", "rb"))
+    return similarity, movies_list
+
+
+def recommend_from_dataset(selected_movie):
+    similarity, movies_list = load_recommender_data()
+    try:
+        movie_index = movies_list[movies_list['title'] == selected_movie].index[0]
+    except:
+        return [], []
+
     distances = similarity[movie_index]
-    fetched_movies = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])
-    recommend_movies = []
+    sorted_movies = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])[1:6]
+
+    names = []
     posters = []
 
-    for j in fetched_movies[1:6]:
-        movieDataFetched = GetMovieFromName(movies_list.iloc[j[0]].title)
-        if movieDataFetched and 'Poster' in movieDataFetched:
-            posters.append(movieDataFetched['Poster'])
-            recommend_movies.append(movies_list.iloc[j[0]].title)
+    for idx, _ in sorted_movies:
+        name = movies_list.iloc[idx].title
+        tmdb_results = search_movies_tmdb(name, max_results=1)
+        poster = tmdb_results[0]["poster"] if tmdb_results else None
+        names.append(name)
+        posters.append(poster)
 
-    return posters, recommend_movies
+    return posters, names
 
 
+# ────────────────────────────────────────────────
+#   MAIN UI - no use_column_width anywhere
+# ────────────────────────────────────────────────
 def main():
-    st.subheader("WATCH NOW")
-    # A random movie extracted from the dataset
-    # and its details and posters fetched from imdb website using the imdb API
+    st.title("🎬 Movie Recommender & Explorer")
 
-    col6, col7, col8 = st.columns(3)
+    # Global search section
+    st.subheader("🌍 Search any movie (like TMDB / Netflix)")
+    query = st.text_input(
+        "",
+        placeholder="jailer, kgf, pushpa, war, avengers, bahubali...",
+        label_visibility="collapsed"
+    )
 
-    all_movie_titles = movies_list['title'].tolist()
+    if query.strip():
+        with st.spinner("Searching..."):
+            results = search_movies_tmdb(query)
 
-    # Choose a single random movie title using numpy's random.choice
-    random_movie_title = np.random.choice(all_movie_titles, size=1, replace=False)[0]
-    # print(random_movie_title)
-    # Get movie details using your function (replace GetMovieFromName with your actual function)
-    random_movie_detail = GetMovieFromName(random_movie_title)
+        if results:
+            cols = st.columns(4)
+            for i, movie in enumerate(results):
+                with cols[i % 4]:
+                    if movie["small_poster"]:
+                        st.image(movie["small_poster"], width=185)
+                    else:
+                        st.image("https://placehold.co/185x278?text=No+Poster", width=185)
 
-    if random_movie_detail and 'imdbID' in random_movie_detail:
-        allDetails = GetMovieFromID(random_movie_detail['imdbID'])
+                    st.markdown(f"**{movie['title']}**")
+                    st.caption(f"{movie['year']} • ★ {movie['rating']:.1f}")
 
-        with col6:
-            # Display the poster image
-            st.image(random_movie_detail['Poster'])
-
-        with col7:
-            # Display the random movie title
-            Title = random_movie_detail['Title']
-            st.markdown(f'<div style="font-weight: bold; font-size: 30px;">Title:&nbsp;{Title}</div><br>',
-                        unsafe_allow_html=True)
-            Release_year = random_movie_detail['Year']
-            st.markdown(f'<div style="font-weight: bold;">Release year:&nbsp;{Release_year}</div><br>',
-                        unsafe_allow_html=True)
-            imdbID = random_movie_detail['imdbID']
-            st.markdown(f'<div style="font-weight: bold;">IMDB id:&nbsp;{imdbID}</div><br>', unsafe_allow_html=True)
-            overview = (allDetails['overview'] if 'overview' in allDetails else '')
-            st.markdown(f'<div style="font-weight: bold;">Overview:&nbsp;{overview}</div><br>', unsafe_allow_html=True)
-
-            # Check if 'genres' key exists in allDetails
-            if 'genres' in allDetails:
-                genre_names = [genre['name'] for genre in allDetails['genres']]
-                genre = ", ".join(genre_names)
-                st.markdown(f'<div style="font-weight: bold;">Genres:&nbsp;{genre}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div style="font-weight: bold;">Genres:&nbsp;N/A</div>', unsafe_allow_html=True)
-        # with col8:
-        #     st.text("")
-
-    else:
-        st.warning("Movie details not available.")
-
-    # Movie Recommender System
-    st.title('Movie Recommender system')
-    selected_movie_name = st.selectbox('SEARCH YOUR MOVIE', movies_list['title'].values, key="search_movie")
-
-    if st.button('Search'):
-        poster, recommendations = recommend(selected_movie_name)
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-
-        if len(recommendations) >= 1:
-            with col1:
-                st.text(recommendations[0])
-                st.markdown(f'<img src="{poster[0]}" style="height:300px; width:200px;">', unsafe_allow_html=True)
-
-        if len(recommendations) >= 2:
-            with col2:
-                st.text(recommendations[1])
-                st.markdown(f'<img src="{poster[1]}" style="height:300px; width:200px;">', unsafe_allow_html=True)
-
-        if len(recommendations) >= 3:
-            with col3:
-                st.text(recommendations[2])
-                st.markdown(f'<img src="{poster[2]}" style="height:300px; width:200px;">', unsafe_allow_html=True)
-
-        if len(recommendations) >= 4:
-            with col4:
-                st.text(recommendations[3])
-                st.markdown(f'<img src="{poster[3]}" style="height:300px; width:200px;">', unsafe_allow_html=True)
-
-        if len(recommendations) >= 5:
-            with col5:
-                st.text(recommendations[4])
-                st.markdown(f'<img src="{poster[4]}" style="height:300px; width:200px;">', unsafe_allow_html=True)
-
-    # st.markdown("""<br><br>""")
-    st.text("")
-    # Displaying other movies
-    st.subheader("\n\nAll time favourites")
-    random_movie_title2 = np.random.choice(all_movie_titles, size=5, replace=False)
-    other_movie_details = [GetMovieFromName(title) for title in random_movie_title2]
-
-    col_movies = st.columns(5)
-
-    for i in range(5):
-        col = col_movies[i]
-        if other_movie_details[i] and 'Poster' in other_movie_details[i]:
-            col.text(random_movie_title2[i])
-            # Adjust height and width of the poster image
-            col.markdown(f'<img src="{other_movie_details[i]["Poster"]}" style="height:300px; width:200px;">',
-                         unsafe_allow_html=True)
+                    with st.expander("Overview"):
+                        st.write(movie["overview"][:160] + "..." if len(movie["overview"]) > 160 else movie["overview"])
         else:
-            continue
+            st.info("No results or connection issue – check error above if any")
+
+    st.divider()
+
+    # ML Recommender section
+    st.subheader("🤖 Recommendations of your choice")
+
+    try:
+        _, movies_list = load_recommender_data()
+        selected = st.selectbox(
+            "Choose a movie from dataset",
+            [""] + sorted(movies_list["title"].values.tolist()),
+            index=0
+        )
+
+        if selected and st.button("Get Recommendations"):
+            with st.spinner("Loading recommendations..."):
+                posters, names = recommend_from_dataset(selected)
+
+            if names:
+                rec_cols = st.columns(5)
+                for i in range(min(5, len(names))):
+                    with rec_cols[i]:
+                        if posters[i]:
+                            st.image(posters[i], width=220)
+                        else:
+                            st.image("https://placehold.co/220x330?text=No+Poster", width=220)
+                        st.caption(names[i])
+            else:
+                st.warning("No recommendations found")
+    except Exception as e:
+        st.error(f"Model loading failed: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
